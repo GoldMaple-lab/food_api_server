@@ -43,22 +43,26 @@ const storage = multer.diskStorage({
 // Middleware ของ Multer
 const upload = multer({
   storage: storage,
-  limits: { fileSize: 5000000 }, // จำกัดขนาดไฟล์ 5MB
+  limits: { fileSize: 50 * 1024 * 1024 }, // จำกัดขนาดไฟล์ 50MB
   fileFilter: (req, file, cb) => {
-    // [!!] ---- โค้ดใหม่ที่ยืดหยุ่นกว่า ----
-    // เราจะเช็คที่ mimetype (ประเภทไฟล์จริงๆ)
-    if (file.mimetype == "image/jpeg" || 
-        file.mimetype == "image/png" || 
-        file.mimetype == "image/gif" ||
-        file.mimetype == "image/webp" ||  // [!] อนุญาต .webp
-        file.mimetype == "image/heic") {  // [!] อนุญาต .heic (iPhone)
+    console.log("--- Incoming File Info ---");
+    console.log("Filename:", file.originalname);
+    console.log("Mimetype:", file.mimetype);
+    console.log("--------------------------");
 
-      cb(null, true); // (อนุญาตไฟล์นี้)
+    // 1. เช็คว่าเป็น mimetype รูปภาพปกติหรือไม่? (image/jpeg, image/png, etc.)
+    const isImageMime = file.mimetype.startsWith('image/');
 
+    // 2. [!!] เช็คกรณีพิเศษ: ถ้าเป็น octet-stream แต่มีนามสกุลเป็นรูปภาพ
+    const isOctetWithImageExt = file.mimetype === 'application/octet-stream' && 
+                                file.originalname.match(/\.(jpg|jpeg|png|gif|webp|heic)$/i);
+
+    // ถ้าเข้าข่ายข้อ 1 หรือ ข้อ 2 ให้ผ่าน
+    if (isImageMime || isOctetWithImageExt) {
+      cb(null, true);
     } else {
-      // ถ้าไฟล์ไม่ตรงกับที่อนุญาต
-      console.log("Rejected file mimetype:", file.mimetype); // [!] Log บอกเรา
-      cb(new Error('Images Only! (Unsupported file type)')); // [!] ส่ง Error ที่ชัดเจนขึ้น
+      console.log("❌ Rejected file:", file.mimetype);
+      cb(new Error(`Invalid file type: ${file.mimetype}`));
     }
   }
 });
@@ -433,45 +437,83 @@ app.delete('/api/menus/:menuId', checkAuth, async (req, res) => {
   }
 });
 
-// 11. Create Order (สร้างออเดอร์ - ผู้ซื้อ)
-// [!!] ใช้ checkAuth
+// 11. Create Order (Auto Log Food)
 app.post('/api/orders', checkAuth, async (req, res) => {
   const buyerId = req.userData.userId;
-  const { store_id, total_price, items } = req.body; // items คือ [ {menu_id, quantity, price}, ... ]
+  const { store_id, total_price, items } = req.body; 
+  // items ตอนนี้มี { menu_id, quantity, price_at_time, title, calories }
 
   if (req.userData.role !== 'buyer') {
     return res.status(403).json({ message: 'Only buyers can create orders.' });
   }
 
-  // 1. สร้าง Order หลัก
+  // [!!] ฟังก์ชันคำนวณมื้ออาหารจากเวลา
+  const getMealTime = () => {
+    const hour = new Date().getHours();
+    if (hour >= 5 && hour < 11) return 'breakfast'; // 05:00 - 10:59
+    if (hour >= 11 && hour < 16) return 'lunch';    // 11:00 - 15:59
+    if (hour >= 16 && hour < 22) return 'dinner';   // 16:00 - 21:59
+    return 'snack';                                 // เวลาอื่นเป็นของว่าง
+  };
+
+  let connection;
   try {
-    const [orderResult] = await pool.execute(
+    connection = await pool.getConnection();
+    await connection.beginTransaction();
+
+    // 1. สร้าง Order หลัก
+    const [orderResult] = await connection.execute(
       'INSERT INTO orders (buyer_id, store_id, total_price) VALUES (?, ?, ?)',
       [buyerId, store_id, total_price]
     );
     const orderId = orderResult.insertId;
 
-    // 2. เพิ่ม Order Items (วน Loop)
-    const itemPromises = items.map(item => {
-      return pool.execute(
+    // 2. เพิ่ม Order Items และ [!!] บันทึกลง Food Logs
+    const currentMealTime = getMealTime(); // คำนวณมื้อ
+    
+    const itemPromises = items.map(async (item) => {
+      // 2.1 ใส่ตาราง Order Items
+      await connection.execute(
         'INSERT INTO order_items (order_id, menu_id, quantity, price_at_time) VALUES (?, ?, ?, ?)',
         [orderId, item.menu_id, item.quantity, item.price_at_time]
       );
+
+      // 2.2 [!!] ใส่ตาราง Food Logs (Auto Log)
+      // (ถ้าสั่ง 2 จาน ก็คูณแคลอรี่ไปเลย หรือจะแยก log ก็ได้ แต่อันนี้รวมให้)
+      const totalCalories = (item.calories || 0) * item.quantity;
+      
+      await connection.execute(
+        'INSERT INTO food_logs (user_id, menu_id, title, meal_time, calories, eaten_at) VALUES (?, ?, ?, ?, ?, NOW())',
+        [
+          buyerId, 
+          item.menu_id, 
+          item.title || 'Unknown Menu', 
+          currentMealTime, 
+          totalCalories
+        ]
+      );
     });
-    await Promise.all(itemPromises); // รันพร้อมกัน
-
-    // 3. [!!] Real-time: แจ้งเตือนผู้ขาย
-    const io = req.app.get('io'); // ดึง io ที่เราเซ็ตไว้
-    const [storeRows] = await pool.execute('SELECT seller_id FROM stores WHERE store_id = ?', [store_id]);
-    const sellerId = storeRows[0].seller_id;
     
-    // [!] ส่งไปที่ "ห้อง" ของผู้ขายคนนั้น
-    io.to(sellerId.toString()).emit('new_order', { orderId: orderId, message: 'You have a new order!' });
+    await Promise.all(itemPromises);
 
-    res.status(201).json({ message: 'Order created successfully', orderId: orderId });
+    // 3. Real-time Notification (เหมือนเดิม)
+    const io = req.app.get('io');
+    const [storeRows] = await connection.execute('SELECT seller_id FROM stores WHERE store_id = ?', [store_id]);
+    
+    if (storeRows.length > 0) {
+       const sellerId = storeRows[0].seller_id;
+       io.to(sellerId.toString()).emit('new_order', { orderId: orderId, message: 'You have a new order!' });
+    }
+
+    await connection.commit();
+    res.status(201).json({ message: 'Order created and food logged successfully', orderId: orderId });
+
   } catch (error) {
+    if (connection) await connection.rollback();
     console.error("Create Order Error:", error);
     res.status(500).json({ message: 'Error creating order' });
+  } finally {
+    if (connection) connection.release();
   }
 });
 
