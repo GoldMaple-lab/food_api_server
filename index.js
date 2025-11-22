@@ -705,7 +705,7 @@ app.get('/api/menus/search', async (req, res) => {
   if (type === 'order') {
     whereClauses.push('m.store_id IS NOT NULL');
   } else if (type === 'recipe') {
-    whereClauses.push('m.store_id IS NULL');
+     whereClauses.push('m.recipe IS NOT NULL');
   }
   if (tags) {
     const tagIds = tags.split(',').map(id => parseInt(id)); 
